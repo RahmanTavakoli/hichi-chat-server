@@ -51,12 +51,7 @@ export function handleWsEvent(ws: AuthenticatedWebSocket, raw: unknown): void {
         return;
       }
 
-      const message = messageStore.addMessage(
-        roomId,
-        ws.userId,
-        ws.username,
-        content,
-      );
+      const message = messageStore.addMessage(roomId, ws.userId, ws.username, content);
 
       // Broadcast to all clients in the same room
       broadcastToRoom(roomId, {

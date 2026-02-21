@@ -1,5 +1,5 @@
 import 'ws';
-import { JwtPayload } from '@services/auth.service';
+import { JwtPayload } from '@/services/auth.service';
 
 declare module 'ws' {
   interface WebSocket {

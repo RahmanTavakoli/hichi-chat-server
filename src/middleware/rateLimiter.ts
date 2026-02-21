@@ -1,15 +1,11 @@
 import rateLimit from 'express-rate-limit';
 
-const createLimiter = (
-  windowMs: number,
-  max: number,
-  message: string,
-) =>
+const createLimiter = (windowMs: number, max: number, message: string) =>
   rateLimit({
     windowMs,
     max,
     message: { status: 'error', message },
-    standardHeaders: true,  // Return rate limit info in the `RateLimit-*` headers
+    standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
     legacyHeaders: false,
     skipSuccessfulRequests: false,
     // Use X-Forwarded-For only if you're behind a trusted proxy

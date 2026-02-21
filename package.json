@@ -5,7 +5,7 @@
     "build": "tsc --project tsconfig.json",
     "start": "node dist/server.js",
     "dev": "ts-node-dev --respawn --transpile-only -r tsconfig-paths/register src/server.ts",
-    "lint": "prettier --check \"src/**/*.ts\"",
+    "lint": "prettier --check lint \"src/**/*.ts\"",
     "format": "prettier --write \"src/**/*.ts\"",
     "prepare": "husky install"
   },

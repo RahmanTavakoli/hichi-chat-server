@@ -6,8 +6,8 @@ import { env } from '@/config/env';
 // Argon2id is the recommended variant (resistant to side-channel + GPU attacks)
 const ARGON2_OPTIONS: argon2.Options = {
   type: argon2.argon2id,
-  memoryCost: 65536,  // 64 MiB
-  timeCost: 4,        // 4 iterations
+  memoryCost: 65536, // 64 MiB
+  timeCost: 4, // 4 iterations
   parallelism: 2,
   hashLength: 32,
 };
@@ -25,7 +25,7 @@ export async function verifyPassword(hash: string, plaintext: string): Promise<b
 }
 
 export interface JwtPayload {
-  sub: string;       // user._id
+  sub: string; // user._id
   username: string;
   iat?: number;
   exp?: number;

@@ -85,9 +85,7 @@ UserSchema.virtual('isLocked').get(function (this: IUserDocument): boolean {
 });
 
 // Method: increment failed login attempts & apply lockout
-UserSchema.methods.incrementLoginAttempts = async function (
-  this: IUserDocument,
-): Promise<void> {
+UserSchema.methods.incrementLoginAttempts = async function (this: IUserDocument): Promise<void> {
   // If lock expired, reset
   if (this.lockUntil && this.lockUntil < new Date()) {
     await this.updateOne({
@@ -105,9 +103,5 @@ UserSchema.methods.incrementLoginAttempts = async function (
 
   await this.updateOne(update);
 };
-
-// Index for fast lookup, TTL queries
-UserSchema.index({ email: 1 });
-UserSchema.index({ username: 1 });
 
 export const User: Model<IUserDocument> = model<IUserDocument>('User', UserSchema);

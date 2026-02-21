@@ -72,8 +72,7 @@ export async function login(
 
     // Constant-time response: always run verify even if user not found
     // to prevent timing-based user enumeration
-    const DUMMY_HASH =
-      '$argon2id$v=19$m=65536,t=4,p=2$placeholder$placeholder';
+    const DUMMY_HASH = '$argon2id$v=19$m=65536,t=4,p=2$placeholder$placeholder';
     const passwordHash = user?.passwordHash ?? DUMMY_HASH;
     const isValid = await verifyPassword(passwordHash, password);
 
@@ -126,7 +125,7 @@ export async function login(
   }
 }
 
-export async function refresh(req: Request, res: Response, next: NextFunction): Promise<void> {
+export async function refresh(req: Request, res: Response): Promise<void> {
   try {
     const token = req.signedCookies?.refreshToken as string | undefined;
 

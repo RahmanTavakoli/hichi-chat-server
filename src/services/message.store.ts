@@ -61,7 +61,7 @@ class InMemoryMessageStore {
     rawContent: string,
   ): ChatMessage {
     const sanitizedContent = filterXSS(rawContent, {
-      whiteList: {},        // strip ALL HTML tags
+      whiteList: {}, // strip ALL HTML tags
       stripIgnoreTag: true,
       stripIgnoreTagBody: ['script', 'style'],
     });
@@ -134,7 +134,9 @@ class InMemoryMessageStore {
     }
 
     if (evicted > 0) {
-      console.log(`[MessageStore GC] Evicted ${evicted} stale rooms. Active rooms: ${this.store.size}`);
+      console.log(
+        `[MessageStore GC] Evicted ${evicted} stale rooms. Active rooms: ${this.store.size}`,
+      );
     }
   }
 
