@@ -8,8 +8,9 @@ import {
   verifyRefreshToken,
   hashRefreshToken,
 } from '@/services/auth.service';
-import { env } from '@/config/env';
+
 import type { RegisterBody, LoginBody } from '@/schemas/auth.schema';
+import { env } from '@/config/env';
 
 const COOKIE_BASE_OPTIONS = {
   httpOnly: true,

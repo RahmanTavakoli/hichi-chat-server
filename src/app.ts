@@ -12,6 +12,9 @@ import authRoutes from '@/routes/auth.routes';
 export function createApp(): Application {
   const app = express();
 
+  // ─── Proxy Configuration (Security & Rate Limiter) ─────────────────────────
+  app.set('trust proxy', 1);
+
   // ─── HTTP Security Headers ─────────────────────────────────────────────────
   app.use(
     helmet({
@@ -45,15 +48,21 @@ export function createApp(): Application {
 
   // ─── NoSQL Injection Sanitization ──────────────────────────────────────────
   app.use((req: Request, _res: Response, next: NextFunction) => {
-    req.body = mongoSanitize(req.body);
-    req.params = mongoSanitize(req.params) as typeof req.params;
-    req.query = mongoSanitize(req.query) as typeof req.query;
+    if (req.body) mongoSanitize(req.body);
+    if (req.params) mongoSanitize(req.params);
+    if (req.query) mongoSanitize(req.query);
+
     next();
   });
 
   // ─── Disable fingerprinting ────────────────────────────────────────────────
   app.disable('x-powered-by');
   app.disable('etag');
+
+  //! JUST route for prevent Crash App & Redirect to Client
+  app.get('/', globalRateLimiter, (_req: Request, res: Response) => {
+    res.redirect('https://digikala.ir');
+  });
 
   // ─── Global Rate Limiter ───────────────────────────────────────────────────
   app.use('/api', globalRateLimiter);
