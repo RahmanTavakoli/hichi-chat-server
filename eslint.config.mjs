@@ -1,80 +1,75 @@
-// eslint.config.js (یا .ts)
-
 import js from '@eslint/js';
 import tseslint from 'typescript-eslint';
 import globals from 'globals';
-
-import eslintPluginReact from 'eslint-plugin-react'
-import eslintPluginUnusedImports from 'eslint-plugin-unused-imports';
-import eslintPluginPrettier from 'eslint-plugin-prettier';
-import eslintPluginNext from '@next/eslint-plugin-next';
 import eslintPluginImport from 'eslint-plugin-import';
+import eslintPluginUnusedImports from 'eslint-plugin-unused-imports';
+import eslintConfigPrettier from 'eslint-config-prettier';
+import eslintPluginPrettier from 'eslint-plugin-prettier';
 
-/** @type {import("eslint").Linter.FlatConfig} */
+/** @type {import("eslint").Linter.FlatConfig[]} */
 export default [
   {
-    ignores: [
-      'node_modules',
-      '.next',
-      'dist',
-      'build',
-      'out',
-      'public',
-      'coverage',
-      'next-env.d.ts',
-    ],
+    // نادیده گرفتن پوشه‌های خروجی و پکیج‌ها
+    ignores: ['node_modules', 'dist', 'build', 'coverage'],
   },
 
+  // تنظیمات پیشنهادی پایه
   js.configs.recommended,
   ...tseslint.configs.recommended,
 
   {
-    files: ['**/*.ts', '**/*.tsx'],
+    files: ['**/*.ts', '**/*.js'],
     languageOptions: {
       parser: tseslint.parser,
       parserOptions: {
         ecmaVersion: 'latest',
         sourceType: 'module',
-        ecmaFeatures: {
-          jsx: true,
-        },
       },
+      // تغییر متغیرهای سراسری از مرورگر به محیط نود جی‌اس
       globals: {
-        ...globals.browser,
+        ...globals.node,
         ...globals.es2021,
-        ...globals.jest,
+        ...globals.jest, // در صورت استفاده از Jest برای تست‌نویسی
       },
     },
     plugins: {
       '@typescript-eslint': tseslint.plugin,
       'import': eslintPluginImport,
-      react: eslintPluginReact,
-      prettier: eslintPluginPrettier,
-      next: eslintPluginNext,
       'unused-imports': eslintPluginUnusedImports,
+      'prettier': eslintPluginPrettier,
     },
     rules: {
-      // TypeScript rules
+      // ادغام Prettier با ESLint به عنوان یک Rule
+      'prettier/prettier': 'warn',
+
+      // --- قوانین تایپ‌اسکریپت ---
+      '@typescript-eslint/no-explicit-any': 'warn', // جلوگیری از استفاده بی‌رویه از any
+      '@typescript-eslint/no-unused-vars': 'off', // غیرفعال کردن این مورد تا پلاگین unused-imports آن را مدیریت کند
       '@typescript-eslint/ban-ts-comment': ['warn', { 'ts-expect-error': 'allow-with-description' }],
-      '@typescript-eslint/no-empty-function': 'warn',
-      '@typescript-eslint/no-non-null-asserted-optional-chain': 'warn',
-      '@typescript-eslint/no-unsafe-function-type': 'warn',
-      '@typescript-eslint/no-empty-object-type': 'warn',
-      '@typescript-eslint/prefer-as-const': 'warn',
-      '@typescript-eslint/no-explicit-any': 'warn',
+      '@typescript-eslint/consistent-type-imports': 'warn', // تشویق به استفاده از import type برای پرفورمنس بهتر
 
-      // React rules
-      'react/jsx-props-no-spreading': 'off',
+      // --- مدیریت ایمپورت‌ها ---
+      'unused-imports/no-unused-imports': 'error', // حذف خودکار ایمپورت‌های بی‌استفاده
+      'unused-imports/no-unused-vars': [
+        'warn',
+        { vars: 'all', varsIgnorePattern: '^_', args: 'after-used', argsIgnorePattern: '^_' },
+      ],
+      'import/order': [
+        'warn',
+        {
+          groups: ['builtin', 'external', 'internal', 'parent', 'sibling', 'index'],
+          'newlines-between': 'always',
+          alphabetize: { order: 'asc', caseInsensitive: true },
+        },
+      ],
 
-      // General rules
+      // --- قوانین عمومی سرور ---
+      'no-console': 'warn', // هشدار برای جا ماندن console.log در پروداکشن (بهتر است از لاگرهایی مثل winston استفاده شود)
       'no-empty-function': 'warn',
       'no-useless-catch': 'warn',
-      'no-undef': 'off',
-
-      // Unused imports cleanup
-      'unused-imports/no-unused-imports': 'warn',
-
-      'import/prefer-default-export': 'off',
     },
   },
+
+  // غیرفعال کردن قوانین ESLint که با Prettier تداخل دارند (باید همیشه در انتهای آرایه باشد)
+  eslintConfigPrettier,
 ];
