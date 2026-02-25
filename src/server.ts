@@ -1,6 +1,6 @@
 import http from 'http';
 import { createApp } from './app';
-import { connectDB } from '@/config/db';
+import { connectDB } from '@/config/prisma';
 import { env } from '@/config/env';
 import { initWebSocketServer } from '@/websocket/ws.server';
 import { messageStore } from '@/services/message.store';
@@ -27,7 +27,7 @@ async function bootstrap(): Promise<void> {
     console.log(`\n${signal} received. Shutting down gracefully...`);
     messageStore.stopGC();
     server.close(async () => {
-      const { disconnectDB } = await import('@/config/db.js');
+      const { disconnectDB } = await import('@/config/prisma.js');
       await disconnectDB();
       console.log('✅ Clean shutdown complete.');
       process.exit(0);

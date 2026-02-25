@@ -3,97 +3,184 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { IncomingMessage } from 'http';
 import { parse as parseCookie } from 'cookie';
 
-import { verifyAccessToken, JwtPayload } from '@/services/auth.service';
-import { handleWsEvent } from './ws.handler';
+import { verifyAccessToken, type JwtPayload } from '@/services/auth.service';
+import { broadcastPresence, deliverPendingMessages, handleWsEvent } from './ws.handler';
 import { WsRateLimiter } from './ws.rateLimit';
+import { wsLogger } from './ws.logger';
+import { messageStore } from '@/services/message.store';
 
 export interface AuthenticatedWebSocket extends WebSocket {
   userId: string;
   username: string;
-  currentRoom: string | null;
   rateLimiter: WsRateLimiter;
   isAlive: boolean;
 }
+
+// ─── User Registry ────────────────────────────────────────────────────────────
+// Maps username → active WebSocket for O(1) DM routing.
+// Cleaned up on every disconnect to prevent stale references and memory leaks.
+export const userRegistry = new Map<string, AuthenticatedWebSocket>();
 
 let wss: WebSocketServer;
 
 export function initWebSocketServer(server: http.Server): void {
   wss = new WebSocketServer({
     server,
-    // Enforce strict upgrade authentication before the WS connection is established
     verifyClient: (
       info: { req: IncomingMessage; origin: string; secure: boolean },
       callback: (res: boolean, code?: number, message?: string) => void,
     ) => {
       verifyWsHandshake(info.req, callback);
     },
-    maxPayload: 8 * 1024, // 8kb max frame size
+    maxPayload: 8 * 1024,
     clientTracking: true,
   });
 
-  wss.on('connection', (ws: AuthenticatedWebSocket) => {
+  // ─── BUG FIX #1 ───────────────────────────────────────────────────────────
+  // The native `ws` library passes the original IncomingMessage as the SECOND
+  // argument to the 'connection' event. The previous code omitted `req`,
+  // causing `ws.username` and `ws.userId` to be `undefined` for every connection.
+  wss.on('connection', (ws: AuthenticatedWebSocket, req: IncomingMessage) => {
+    // ── Transfer auth data from handshake to the WS object ─────────────────
+    const wsUser = (req as IncomingMessage & { _wsUser?: JwtPayload })._wsUser;
+
+    // Safety net: verifyClient already validated the token, but guard anyway
+    if (!wsUser?.sub || !wsUser?.username) {
+      wsLogger.error('Connection without valid wsUser payload — terminating immediately', {});
+      ws.terminate();
+      return;
+    }
+
+    ws.userId = wsUser.sub;
+    ws.username = wsUser.username;
     ws.isAlive = true;
-    ws.currentRoom = null;
-    ws.rateLimiter = new WsRateLimiter(20, 10_000); // 20 events per 10s per connection
+    ws.rateLimiter = new WsRateLimiter(100, 10_000); // 100 events / 10 s
 
-    console.log(`[WSS] Client connected: ${ws.username} (${ws.userId})`);
+    // ── Register in the routing table ─────────────────────────────────────
+    // If the same user reconnects (e.g. refresh), evict the old socket first
+    const existingSocket = userRegistry.get(ws.username);
+    if (existingSocket && existingSocket !== ws) {
+      wsLogger.warn('Duplicate connection — evicting old socket', { username: ws.username });
+      existingSocket.terminate();
+    }
+    userRegistry.set(ws.username, ws);
 
+    wsLogger.info('Client connected', {
+      username: ws.username,
+      userId: ws.userId,
+      clientCount: userRegistry.size,
+    });
+
+    // ── NEW: Broadcast online presence to all connected peers ────────────
+    broadcastPresence(ws.username, 'online');
+
+    // ── NEW: Deliver any queued offline messages immediately ──────────────
+    // This runs AFTER userRegistry.set so the client can receive the frame.
+    // The frame arrives before any UI interaction, ensuring inbox is full
+    // as soon as the connection is established.
+    deliverPendingMessages(ws);
+
+    // ── Message handler ───────────────────────────────────────────────────
     ws.on('message', (rawData) => {
-      // Enforce rate limit per connection before any processing
       if (!ws.rateLimiter.isAllowed()) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Rate limit exceeded. Slow down.' }));
+        wsLogger.warn('Rate limit hit — message dropped', { username: ws.username });
+        ws.send(
+          JSON.stringify({ type: 'error', message: 'Rate limit exceeded. Slow down.', code: 4003 }),
+        );
         return;
       }
 
       let parsed: unknown;
       try {
-        // Hard-cap parsed size & ensure valid JSON
         const text = rawData.toString('utf-8').slice(0, 8192);
         parsed = JSON.parse(text);
       } catch {
-        ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON payload' }));
+        wsLogger.warn('Unparseable message received', { username: ws.username });
+        ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON payload', code: 4001 }));
         return;
       }
+
+      wsLogger.debug('Message received', {
+        username: ws.username,
+        event: (parsed as Record<string, unknown>)?.type as string,
+      });
 
       handleWsEvent(ws, parsed);
     });
 
+    // ── Heartbeat pong ─────────────────────────────────────────────────────
     ws.on('pong', () => {
       ws.isAlive = true;
     });
 
-    ws.on('close', () => {
-      console.log(`[WSS] Client disconnected: ${ws.username}`);
+    // ── Cleanup on disconnect ──────────────────────────────────────────────
+    ws.on('close', (code, reason) => {
+      // ── NEW: Requeue un-ACKed pending messages ──
+      // اگر پیام‌هایی برای کلاینت ارسال شده اما تاییدیه‌ای دریافت نشد، آن‌ها را به صف بازگردان
+      const flushed = (ws as any)._pendingFlushed;
+      if (flushed && flushed.length > 0) {
+        wsLogger.warn('Socket closed before ACK. Requeueing pending messages.', {
+          username: ws.username,
+          count: flushed.length,
+        });
+        messageStore.pending.requeue(ws.username, flushed);
+      }
+
+      // Only remove from registry if this is the current socket for that user
+      if (userRegistry.get(ws.username) === ws) {
+        userRegistry.delete(ws.username);
+      }
+
+      broadcastPresence(ws.username, 'offline');
+
+      wsLogger.info('Client disconnected', {
+        username: ws.username,
+        code,
+        reason: reason.toString(),
+        clientCount: userRegistry.size,
+      });
     });
 
     ws.on('error', (err) => {
-      console.error(`[WSS] Error for user ${ws.username}:`, err.message);
+      wsLogger.error('Socket error', { username: ws.username, error: err.message });
     });
   });
 
-  // Heartbeat: ping all clients every 30s, terminate stale connections
+  // ─── Heartbeat Loop ────────────────────────────────────────────────────────
+  // Terminates ghost connections (e.g. browser tab closed without TCP FIN)
   const heartbeatInterval = setInterval(() => {
+    let terminated = 0;
     wss.clients.forEach((rawWs) => {
       const ws = rawWs as AuthenticatedWebSocket;
       if (!ws.isAlive) {
-        console.log(`[WSS] Terminating stale connection: ${ws.username}`);
-        return ws.terminate();
+        wsLogger.warn('Terminating stale connection', { username: ws.username });
+        ws.terminate();
+        terminated++;
+        return;
       }
       ws.isAlive = false;
       ws.ping();
     });
+    if (terminated > 0) {
+      wsLogger.info('Heartbeat sweep complete', { terminated, active: userRegistry.size });
+    }
   }, 30_000);
 
+  // timer.unref() ensures the heartbeat does NOT keep the process alive
+  // after all other async work is done — critical for graceful shutdown
   heartbeatInterval.unref();
 
-  wss.on('close', () => clearInterval(heartbeatInterval));
-  console.log('[WSS] WebSocket server initialized');
+  wss.on('close', () => {
+    clearInterval(heartbeatInterval);
+    wsLogger.info('WebSocket server closed', {});
+  });
+
+  wsLogger.info('WebSocket server initialized', {});
 }
 
-/**
- * Handshake verification: runs BEFORE the WebSocket upgrade is accepted.
- * Rejects the entire TCP upgrade if the JWT is missing or invalid.
- */
+// ─── Handshake Verification ────────────────────────────────────────────────────
+// Runs BEFORE the HTTP → WebSocket upgrade is accepted at the TCP level.
+// Rejecting here means the socket is never opened — no resource is allocated.
 function verifyWsHandshake(
   req: IncomingMessage,
   callback: (res: boolean, code?: number, message?: string) => void,
@@ -101,36 +188,34 @@ function verifyWsHandshake(
   try {
     let token: string | undefined;
 
-    // 1. Try cookie (preferred for browser clients)
+    // Priority 1: HttpOnly signed cookie `ws_token`
     const cookieHeader = req.headers.cookie;
     if (cookieHeader) {
       const cookies = parseCookie(cookieHeader);
-      // Signed cookies require express cookie-parser — parse the raw value here
-      // For simplicity, the WS client can also pass an unsigned short-lived token
       token = cookies['ws_token'];
     }
 
-    // 2. Try query param (useful for native clients where cookies aren't available)
-    // NOTE: query params appear in server logs — only use as fallback for non-browser
+    // Priority 2: ?token= query parameter (for native/mobile clients)
+    // Note: query params appear in server access logs; keep tokens short-lived
     if (!token) {
       const url = new URL(req.url ?? '', `http://${req.headers.host}`);
-      const queryToken = url.searchParams.get('token');
-      if (queryToken) token = queryToken;
+      token = url.searchParams.get('token') ?? undefined;
     }
 
     if (!token) {
-      console.warn('[WSS] Rejected: No token in handshake');
+      wsLogger.warn('Handshake rejected: no token', {});
       return callback(false, 401, 'Unauthorized: No authentication token provided');
     }
 
     const payload = verifyAccessToken(token);
 
-    // Attach auth data directly to the request so we can transfer to the WS object
+    // Attach to request for the 'connection' handler to consume
     (req as IncomingMessage & { _wsUser?: JwtPayload })._wsUser = payload;
 
+    wsLogger.debug('Handshake accepted', { username: payload.username });
     callback(true);
   } catch (err) {
-    console.warn('[WSS] Rejected: Invalid token -', (err as Error).message);
+    wsLogger.warn('Handshake rejected: invalid token', { error: (err as Error).message });
     callback(false, 401, 'Unauthorized: Invalid or expired token');
   }
 }

@@ -1,0 +1,27 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id               String    @id @default(uuid())
+  username         String    @unique
+  nickname         String
+  avatar_url       String
+  passwordHash     String
+  refreshTokenHash String?
+  loginAttempts    Int       @default(0)
+  lockUntil        DateTime?
+  isActive         Boolean   @default(true)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  // برای جلوگیری از جستجوهای کند روی نام کاربری
+  @@index([username])
+}

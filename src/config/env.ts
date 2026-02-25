@@ -10,12 +10,13 @@ const EnvSchema = z.object({
     .regex(/^\d+$/)
     .transform(Number)
     .default('4000' as never),
-  MONGO_URI: z.string().url(),
+  DATABASE_URL: z.string(),
   JWT_SECRET: z.string(),
   JWT_EXPIRES_IN: z.string().default('15m'),
   JWT_REFRESH_SECRET: z.string(),
   JWT_REFRESH_EXPIRES_IN: z.string().default('7d'),
   COOKIE_SECRET: z.string().min(32),
+  MSG_PENDING_TTL_MS: z.string().transform(Number),
   ALLOWED_ORIGINS: z.string().transform((val) => val.split(',')),
   // In-memory store limits
   MSG_STORE_MAX_ROOMS: z

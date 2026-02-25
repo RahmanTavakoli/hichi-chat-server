@@ -16,14 +16,14 @@ export const RegisterSchema = z.object({
       .min(3)
       .max(30)
       .regex(/^[a-zA-Z0-9_]+$/, 'Username may only contain letters, numbers, and underscores'),
-    email: z.string().email().max(254).toLowerCase(),
+    nickname: z.string().max(254).toLowerCase(),
     password: passwordSchema,
   }),
 });
 
 export const LoginSchema = z.object({
   body: z.object({
-    email: z.string().email().max(254).toLowerCase(),
+    username: z.string().max(254).toLowerCase(),
     password: z.string().min(1).max(128),
   }),
 });

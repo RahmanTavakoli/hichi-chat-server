@@ -22,6 +22,23 @@ export const globalRateLimiter = createLimiter(
 // Auth endpoints: stricter — 10 attempts per 15 minutes per IP
 export const authRateLimiter = createLimiter(
   15 * 60 * 1000,
-  10,
+  50,
   'Too many authentication attempts. Please try again in 15 minutes',
+);
+
+/**
+ * Search rate limiter — stricter than global, looser than auth.
+ *
+ * Rationale:
+ * - The search endpoint hits MongoDB with a regex query on each call.
+ * - Even with index anchoring (^prefix), allowing hundreds of searches
+ *   per minute from one IP would be an easy vector for database DoS.
+ * - 20 requests per minute allows normal user behaviour (typing a username
+ *   character by character with 450ms debounce ≈ ~4 requests per search
+ *   session) while blocking automated enumeration attempts.
+ */
+export const searchRateLimiter = createLimiter(
+  60 * 1000, // 1-minute window
+  20, // 20 searches per minute per IP
+  'Too many search requests. Please slow down.',
 );

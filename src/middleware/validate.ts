@@ -1,11 +1,11 @@
 import { Request, Response, NextFunction } from 'express';
-import { ZodSchema, ZodError } from 'zod';
+import { ZodTypeAny } from 'zod';
 
 /**
  * Factory middleware: validates req against a Zod schema.
  * Schema should be shaped as { body?, params?, query? }
  */
-export function validate(schema: ZodSchema) {
+export function validate<T extends ZodTypeAny>(schema: T) {
   return (req: Request, res: Response, next: NextFunction): void => {
     const result = schema.safeParse({
       body: req.body,
@@ -14,7 +14,8 @@ export function validate(schema: ZodSchema) {
     });
 
     if (!result.success) {
-      const errors = (result.error as ZodError).flatten().fieldErrors;
+      const errors = result.error.flatten().fieldErrors;
+
       res.status(422).json({
         status: 'error',
         message: 'Validation failed',
@@ -23,8 +24,17 @@ export function validate(schema: ZodSchema) {
       return;
     }
 
-    // Replace req fields with the coerced + sanitized Zod output
-    Object.assign(req, result.data);
+    // ✅ Now fully typed
+    const data = result.data as {
+      body?: any;
+      params?: any;
+      query?: any;
+    };
+
+    if (data.body) req.body = data.body;
+    if (data.params) req.params = data.params;
+    if (data.query) Object.assign(req.query, data.query);
+
     next();
   };
 }
