@@ -1,6 +1,5 @@
 import { PrismaClient } from '@prisma/client';
 
-// ساخت یک نمونه سینگلتون از پریزما
 export const prisma = new PrismaClient({
   log: process.env.NODE_ENV === 'development' ? ['query', 'error', 'warn'] : ['error'],
 });
