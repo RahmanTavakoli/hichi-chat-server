@@ -58,6 +58,13 @@ export const WsMessageSchema = z.discriminatedUnion('type', [
     to: usernameField,
   }),
 
+  // ── mark_read ───────────────────────────────────────────────────────────
+  z.object({
+    type: z.literal('mark_read'),
+    to: usernameField, // شناسه کاربری که پیام‌ها را فرستاده بود تا به او اطلاع دهیم
+    messageIds: z.array(z.string()).min(1, 'حداقل یک آیدی پیام لازم است'),
+  }),
+
   // ── ping ───────────────────────────────────────────────────────────────────
   // Application-level keep-alive. Proxies (Render, nginx) kill idle WebSocket
   // connections after 55–90s. Sending a ping every ~25s prevents this.

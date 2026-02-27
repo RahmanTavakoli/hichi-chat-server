@@ -1,7 +1,7 @@
 # 📡 Secure Real-Time Messaging Server — Client Integration Guide
 
-> **Stack:** Node.js · Express · MongoDB (Auth) · WebSockets (`ws`)
-> **Architecture:** In-Memory Messaging · MVC · JWT Authentication
+> **Stack:** Node.js · Express · SQLite (Prisma) · WebSockets (`ws`)
+> **Architecture:** Offline-First · Server as Router & Queue · MVC · JWT Auth
 
 ---
 
@@ -23,7 +23,7 @@
 1. [Introduction & Setup](#1-introduction--setup)
 2. [Authentication / The Handshake](#2-authentication--the-handshake)
 3. [Event Catalog](#3-event-catalog)
-4. [React Integration Example](#4-react-integration-example)
+4. [Offline-First Architecture (Important)](#4-offline-first-architecture-important)
 
 ---
 
@@ -31,29 +31,31 @@
 
 ### What Is This Server?
 
-This is a **real-time, ephemeral messaging server**. It handles user authentication through a
-REST API backed by MongoDB, and delivers all chat functionality over a secure, authenticated
-WebSocket connection.
+This is a **real-time, offline-first messaging server**. It handles user authentication through a REST API backed by **SQLite (Prisma)**, and delivers all chat functionality over a secure, authenticated WebSocket connection.
 
-> ⚠️ **Critical — In-Memory Architecture:**
-> All chat messages exist **exclusively in the server's RAM**. There is **no database persistence
-> for messages**. If the server restarts, all chat history is permanently lost. Do not build any
-> UI feature that implies messages will survive a server reboot.
+> ⚠️ **Critical — Architecture:**
+> The server acts strictly as a **Router and Pending Queue**. There is **NO database persistence for chat history** on the server. History must be stored locally on the client (e.g., using `IndexedDB / Dexie.js`). If a recipient is offline, the server holds the message in RAM temporarily until they reconnect.
 
 ### Architectural Overview
 
-```
+````text
 ┌─────────────────────────────────────────────────────────────────┐
 │                        React Client                             │
+│  (History Stored Locally via Dexie.js / IndexedDB)              │
 │                                                                 │
-│  [REST /api/v1/auth]  ──────────►  Login / Register / Refresh  │
-│  [WebSocket wss://…]  ◄────────►  All real-time messaging      │
+│  [REST /api/v1/auth]  ──────────►  Login / Register / Refresh   │
+│  [WebSocket wss://…]  ◄─────────►  Real-time Message Routing    │
 └─────────────────────────────────────────────────────────────────┘
-         │                                   │
-         ▼                                   ▼
-  MongoDB (Users Only)          In-Memory Map (Messages)
-  ─ Persisted ─                ─ Ephemeral / RAM Only ─
-```
+                                 │
+                 [JWT Handshake & Message Payload]
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                       Node.js Backend                           │
+│                                                                 │
+│  1. SQLite (Prisma) ────────► User Auth & Profiles Only         │
+│  2. RAM (Pending Queue) ────► Holds un-delivered messages       │
+└─────────────────────────────────────────────────────────────────┘
 
 ### Installation
 
@@ -67,18 +69,36 @@ with Socket.IO** (confirm with your backend team). The examples below use the **
 # No additional packages required for native WebSocket.
 # If your project uses socket.io-client (confirm with backend team first):
 npm install socket.io-client
-```
+````
 
 ### Environment Configuration
 
 Create a `.env.local` file in your React project root:
 
 ```env
-# WebSocket server URL
-VITE_WS_URL=wss://api.yourdomain.com
+NODE_ENV=development
+PORT=
 
-# REST API base URL (for auth endpoints only)
-VITE_API_URL=https://api.yourdomain.com/api/v1
+# Generate with: openssl rand -hex 64
+JWT_SECRET=your jwt accessToken secret
+JWT_EXPIRES_IN=jwt accessToken expire duration (m)
+
+# Generate with: openssl rand -hex 64
+JWT_REFRESH_SECRET=jwt refreshToken secret
+JWT_REFRESH_EXPIRES_IN=jwt refreshToken expire duration (d)
+
+# Generate with: openssl rand -hex 32
+COOKIE_SECRET=your cookie secret
+
+# Comma-separated, no trailing slash
+ALLOWED_ORIGINS=domains you must allowed to access server
+
+# In-memory store limits
+MSG_STORE_MAX_ROOMS= nuber
+MSG_STORE_MAX_PER_ROOM=number
+MSG_STORE_TTL_MS=number (ms)
+# 1year store pending msg
+MSG_PENDING_TTL_MS=31536000000
 ```
 
 > 📌 **Note:** Use `ws://` for local development and `wss://` (WebSocket Secure) in all
@@ -146,7 +166,10 @@ interface LoginResponse {
  * For clients that read the token from cookies, no further action is needed.
  * If the token is returned in the body, store it in memory (never localStorage).
  */
-export async function login(email: string, password: string): Promise<LoginResponse> {
+export async function login(
+  email: string,
+  password: string,
+): Promise<LoginResponse> {
   const response = await fetch(`${API_URL}/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -167,10 +190,10 @@ export async function login(email: string, password: string): Promise<LoginRespo
 
 The server accepts the JWT in two ways (listed in priority order):
 
-| Method | Mechanism | Recommended For |
-|---|---|---|
+| Method                    | Mechanism                                       | Recommended For             |
+| ------------------------- | ----------------------------------------------- | --------------------------- |
 | **1. Cookie** (preferred) | `ws_token` cookie set by the server after login | Browser clients (automatic) |
-| **2. Query Parameter** | `?token=<jwt>` appended to the WebSocket URL | Native/mobile clients |
+| **2. Query Parameter**    | `?token=<jwt>` appended to the WebSocket URL    | Native/mobile clients       |
 
 > ⚠️ **Security Note on Query Parameters:** The token in a query string may appear in server
 > access logs and browser history. It is acceptable for short-lived access tokens (15-minute
@@ -194,7 +217,9 @@ export function createAuthenticatedSocket(token: string): WebSocket {
   socket.onclose = (event) => {
     if (event.code === 1006) {
       // 1006 = Abnormal closure. Likely caused by a failed handshake (invalid token).
-      console.error('[WS] Connection rejected. Token may be invalid or expired.');
+      console.error(
+        '[WS] Connection rejected. Token may be invalid or expired.',
+      );
     }
   };
 
@@ -214,17 +239,31 @@ you **listen** to (Server → Client).
 
 Always serialize your payload with `JSON.stringify()` before calling `socket.send()`.
 
+Event Type,Payload,Description
+send_message,"{ to: string, content: string, localId: string }",Sends a message. localId is a client-generated UUID for UI tracking.
+typing_start,{ to: string },Notifies the peer that the user started typing.
+typing_stop,{ to: string },Notifies the peer that typing stopped.
+ack_pending,{ ids: string[] },Acknowledges receipt of offline messages so the server deletes them from RAM.
+ping,{ },Keep-alive heartbeat (send every 25 seconds).
+
+Event Type,Payload,Description
+send_message,"{ to: string, content: string, localId: string }",Sends a message. localId is a client-generated UUID for UI tracking.
+typing_start,{ to: string },Notifies the peer that the user started typing.
+typing_stop,{ to: string },Notifies the peer that typing stopped.
+ack_pending,{ ids: string[] },Acknowledges receipt of offline messages so the server deletes them from RAM.
+ping,{ },Keep-alive heartbeat (send every 25 seconds).
+
 ---
 
 #### `send_message`
 
 Sends a new chat message to a specific recipient.
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `type` | `string` | ✅ | Must be exactly `"send_message"` |
-| `roomId` | `string` | ✅ | Target room ID (alphanumeric, max 64 chars) |
-| `content` | `string` | ✅ | The message text (max 2,000 characters) |
+| Field     | Type     | Required | Description                                 |
+| --------- | -------- | -------- | ------------------------------------------- |
+| `type`    | `string` | ✅       | Must be exactly `"send_message"`            |
+| `roomId`  | `string` | ✅       | Target room ID (alphanumeric, max 64 chars) |
+| `content` | `string` | ✅       | The message text (max 2,000 characters)     |
 
 ```typescript
 // Emit: send a message
@@ -243,10 +282,10 @@ socket.send(JSON.stringify(payload));
 
 Subscribes the client to a room and fetches the last 50 messages from in-memory history.
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `type` | `string` | ✅ | Must be exactly `"join_room"` |
-| `roomId` | `string` | ✅ | The room to join |
+| Field    | Type     | Required | Description                   |
+| -------- | -------- | -------- | ----------------------------- |
+| `type`   | `string` | ✅       | Must be exactly `"join_room"` |
+| `roomId` | `string` | ✅       | The room to join              |
 
 ```typescript
 // Emit: join a room
@@ -259,10 +298,10 @@ socket.send(JSON.stringify({ type: 'join_room', roomId: 'room_general' }));
 
 Unsubscribes the client from a room. The client will no longer receive broadcasts for this room.
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `type` | `string` | ✅ | Must be exactly `"leave_room"` |
-| `roomId` | `string` | ✅ | The room to leave |
+| Field    | Type     | Required | Description                    |
+| -------- | -------- | -------- | ------------------------------ |
+| `type`   | `string` | ✅       | Must be exactly `"leave_room"` |
+| `roomId` | `string` | ✅       | The room to leave              |
 
 ```typescript
 // Emit: leave a room
@@ -275,10 +314,10 @@ socket.send(JSON.stringify({ type: 'leave_room', roomId: 'room_general' }));
 
 Requests the last 50 messages for a room (from in-memory store).
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `type` | `string` | ✅ | Must be exactly `"get_history"` |
-| `roomId` | `string` | ✅ | The room whose history to fetch |
+| Field    | Type     | Required | Description                     |
+| -------- | -------- | -------- | ------------------------------- |
+| `type`   | `string` | ✅       | Must be exactly `"get_history"` |
+| `roomId` | `string` | ✅       | The room whose history to fetch |
 
 ```typescript
 // Emit: request history
@@ -310,8 +349,8 @@ interface ChatMessage {
   roomId: string;
   senderId: string;
   senderUsername: string;
-  content: string;       // Already XSS-sanitized by the server
-  timestamp: number;     // Unix timestamp in milliseconds
+  content: string; // Already XSS-sanitized by the server
+  timestamp: number; // Unix timestamp in milliseconds
 }
 ```
 
@@ -364,19 +403,19 @@ interface RoomLeftEvent {
 
 Sent when the server encounters a problem processing a client's message.
 
-| `code` | Meaning |
-|---|---|
+| `code` | Meaning                                                    |
+| ------ | ---------------------------------------------------------- |
 | `4001` | Validation error (malformed payload, invalid roomId, etc.) |
-| `4002` | Not in room (tried to send a message without joining) |
-| `4003` | Rate limit exceeded |
-| `5000` | Internal server error |
+| `4002` | Not in room (tried to send a message without joining)      |
+| `4003` | Rate limit exceeded                                        |
+| `5000` | Internal server error                                      |
 
 ```typescript
 // Incoming payload structure
 interface ErrorEvent {
   type: 'error';
   message: string; // Human-readable description
-  code: number;    // Machine-readable error code
+  code: number; // Machine-readable error code
 }
 ```
 
@@ -384,17 +423,17 @@ interface ErrorEvent {
 
 ### Complete Event Reference Table
 
-| Direction | Event Type | Trigger | Key Payload Fields |
-|---|---|---|---|
-| ➡️ Client → Server | `join_room` | Enter a chat room | `roomId` |
-| ➡️ Client → Server | `leave_room` | Exit a chat room | `roomId` |
-| ➡️ Client → Server | `send_message` | Send a chat message | `roomId`, `content` |
-| ➡️ Client → Server | `get_history` | Fetch room history | `roomId` |
-| ⬅️ Server → Client | `room_joined` | After joining a room | `roomId`, `history[]` |
-| ⬅️ Server → Client | `room_left` | After leaving a room | `roomId` |
-| ⬅️ Server → Client | `new_message` | When any room member sends a msg | `message` |
-| ⬅️ Server → Client | `history` | Response to `get_history` | `roomId`, `messages[]` |
-| ⬅️ Server → Client | `error` | On any server-side error | `message`, `code` |
+| Direction          | Event Type     | Trigger                          | Key Payload Fields     |
+| ------------------ | -------------- | -------------------------------- | ---------------------- |
+| ➡️ Client → Server | `join_room`    | Enter a chat room                | `roomId`               |
+| ➡️ Client → Server | `leave_room`   | Exit a chat room                 | `roomId`               |
+| ➡️ Client → Server | `send_message` | Send a chat message              | `roomId`, `content`    |
+| ➡️ Client → Server | `get_history`  | Fetch room history               | `roomId`               |
+| ⬅️ Server → Client | `room_joined`  | After joining a room             | `roomId`, `history[]`  |
+| ⬅️ Server → Client | `room_left`    | After leaving a room             | `roomId`               |
+| ⬅️ Server → Client | `new_message`  | When any room member sends a msg | `message`              |
+| ⬅️ Server → Client | `history`      | Response to `get_history`        | `roomId`, `messages[]` |
+| ⬅️ Server → Client | `error`        | On any server-side error         | `message`, `code`      |
 
 ---
 
@@ -421,7 +460,12 @@ export interface ChatMessage {
   timestamp: number;
 }
 
-type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'error';
+type ConnectionStatus =
+  | 'idle'
+  | 'connecting'
+  | 'connected'
+  | 'disconnected'
+  | 'error';
 
 interface WsState {
   messages: ChatMessage[];
@@ -436,7 +480,11 @@ type WsAction =
   | { type: 'ERROR'; payload: string }
   | { type: 'HISTORY_LOADED'; payload: ChatMessage[] }
   | { type: 'MESSAGE_RECEIVED'; payload: ChatMessage }
-  | { type: 'CLEAR_MESSAGES' };
+  | { type: 'CLEAR_MESSAGES' }
+  | {
+      type: 'MESSAGES_READ_BY_PEER';
+      payload: { chatId: string; messageIds: string[] };
+    };
 
 function wsReducer(state: WsState, action: WsAction): WsState {
   switch (action.type) {
@@ -589,7 +637,10 @@ export function useWebSocket({
       const isAuthFailure = event.code === 1006 || event.code === 4001;
 
       if (isAuthFailure) {
-        dispatch({ type: 'ERROR', payload: 'Authentication failed. Please log in again.' });
+        dispatch({
+          type: 'ERROR',
+          payload: 'Authentication failed. Please log in again.',
+        });
         return;
       }
 
@@ -599,7 +650,9 @@ export function useWebSocket({
         if (attempts < maxReconnectAttempts) {
           // Exponential backoff: 2s, 4s, 8s, 16s, 32s
           const delay = reconnectDelay * Math.pow(2, attempts);
-          console.warn(`[WS] Disconnected. Reconnecting in ${delay}ms... (attempt ${attempts + 1})`);
+          console.warn(
+            `[WS] Disconnected. Reconnecting in ${delay}ms... (attempt ${attempts + 1})`,
+          );
           reconnectAttemptsRef.current += 1;
           reconnectTimerRef.current = setTimeout(connect, delay);
         } else {
@@ -716,17 +769,51 @@ export function ChatRoom({ token, roomId, currentUserId }: ChatRoomProps) {
   const { label, color } = statusConfig[status];
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', maxWidth: 720 }}>
-
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        height: '100%',
+        maxWidth: 720,
+      }}
+    >
       {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 16px', borderBottom: '1px solid #e5e7eb' }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          padding: '12px 16px',
+          borderBottom: '1px solid #e5e7eb',
+        }}
+      >
         <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>#{roomId}</h2>
-        <span style={{ marginLeft: 'auto', fontSize: 12, color, display: 'flex', alignItems: 'center', gap: 4 }}>
-          <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: color, display: 'inline-block' }} />
+        <span
+          style={{
+            marginLeft: 'auto',
+            fontSize: 12,
+            color,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 4,
+          }}
+        >
+          <span
+            style={{
+              width: 8,
+              height: 8,
+              borderRadius: '50%',
+              backgroundColor: color,
+              display: 'inline-block',
+            }}
+          />
           {label}
         </span>
         {(status === 'disconnected' || status === 'error') && (
-          <button onClick={reconnect} style={{ fontSize: 12, padding: '4px 8px', cursor: 'pointer' }}>
+          <button
+            onClick={reconnect}
+            style={{ fontSize: 12, padding: '4px 8px', cursor: 'pointer' }}
+          >
             Reconnect
           </button>
         )}
@@ -734,18 +821,38 @@ export function ChatRoom({ token, roomId, currentUserId }: ChatRoomProps) {
 
       {/* Error Banner */}
       {error && (
-        <div style={{ background: '#fef2f2', color: '#b91c1c', padding: '8px 16px', fontSize: 13 }}>
+        <div
+          style={{
+            background: '#fef2f2',
+            color: '#b91c1c',
+            padding: '8px 16px',
+            fontSize: 13,
+          }}
+        >
           ⚠️ {error}
         </div>
       )}
 
       {/* Messages */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div
+        style={{
+          flex: 1,
+          overflowY: 'auto',
+          padding: 16,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 12,
+        }}
+      >
         {status === 'connecting' && (
-          <p style={{ color: '#9ca3af', textAlign: 'center', marginTop: 32 }}>Connecting to room…</p>
+          <p style={{ color: '#9ca3af', textAlign: 'center', marginTop: 32 }}>
+            Connecting to room…
+          </p>
         )}
         {messages.length === 0 && status === 'connected' && (
-          <p style={{ color: '#9ca3af', textAlign: 'center', marginTop: 32 }}>No messages yet. Be the first to say hello!</p>
+          <p style={{ color: '#9ca3af', textAlign: 'center', marginTop: 32 }}>
+            No messages yet. Be the first to say hello!
+          </p>
         )}
         {messages.map((msg: ChatMessage) => {
           const isOwn = msg.senderId === currentUserId;
@@ -758,7 +865,14 @@ export function ChatRoom({ token, roomId, currentUserId }: ChatRoomProps) {
               }}
             >
               {!isOwn && (
-                <p style={{ margin: '0 0 2px 4px', fontSize: 11, color: '#6b7280', fontWeight: 600 }}>
+                <p
+                  style={{
+                    margin: '0 0 2px 4px',
+                    fontSize: 11,
+                    color: '#6b7280',
+                    fontWeight: 600,
+                  }}
+                >
                   {msg.senderUsername}
                 </p>
               )}
@@ -766,7 +880,9 @@ export function ChatRoom({ token, roomId, currentUserId }: ChatRoomProps) {
                 style={{
                   background: isOwn ? '#3b82f6' : '#f3f4f6',
                   color: isOwn ? '#fff' : '#111827',
-                  borderRadius: isOwn ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
+                  borderRadius: isOwn
+                    ? '16px 16px 4px 16px'
+                    : '16px 16px 16px 4px',
                   padding: '10px 14px',
                   fontSize: 14,
                   lineHeight: 1.5,
@@ -776,8 +892,18 @@ export function ChatRoom({ token, roomId, currentUserId }: ChatRoomProps) {
               >
                 {msg.content}
               </div>
-              <p style={{ margin: '2px 4px 0', fontSize: 10, color: '#9ca3af', textAlign: isOwn ? 'right' : 'left' }}>
-                {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              <p
+                style={{
+                  margin: '2px 4px 0',
+                  fontSize: 10,
+                  color: '#9ca3af',
+                  textAlign: isOwn ? 'right' : 'left',
+                }}
+              >
+                {new Date(msg.timestamp).toLocaleTimeString([], {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                })}
               </p>
             </div>
           );
@@ -786,12 +912,22 @@ export function ChatRoom({ token, roomId, currentUserId }: ChatRoomProps) {
       </div>
 
       {/* Input */}
-      <form onSubmit={handleSubmit} style={{ display: 'flex', gap: 8, padding: 16, borderTop: '1px solid #e5e7eb' }}>
+      <form
+        onSubmit={handleSubmit}
+        style={{
+          display: 'flex',
+          gap: 8,
+          padding: 16,
+          borderTop: '1px solid #e5e7eb',
+        }}
+      >
         <input
           type="text"
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}
-          placeholder={status === 'connected' ? 'Type a message…' : 'Not connected'}
+          placeholder={
+            status === 'connected' ? 'Type a message…' : 'Not connected'
+          }
           disabled={status !== 'connected'}
           maxLength={2000}
           style={{
@@ -840,8 +976,24 @@ const currentUserId = '6579c6f0a3e4d12b8c9f1234';
 
 function App() {
   return (
-    <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-      <div style={{ width: '100%', maxWidth: 720, height: '80vh', border: '1px solid #e5e7eb', borderRadius: 16, overflow: 'hidden' }}>
+    <div
+      style={{
+        height: '100vh',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+      }}
+    >
+      <div
+        style={{
+          width: '100%',
+          maxWidth: 720,
+          height: '80vh',
+          border: '1px solid #e5e7eb',
+          borderRadius: 16,
+          overflow: 'hidden',
+        }}
+      >
         <ChatRoom
           token={token}
           roomId="room_general"
@@ -880,19 +1032,20 @@ export default App;
 
 ### این سرور چیست؟
 
-این یک **سرور پیام‌رسانی آنی و ناپایدار (Ephemeral)** است. احراز هویت کاربران از طریق یک REST API و پایگاه داده MongoDB انجام می‌شود، اما تمام قابلیت‌های چت از طریق یک اتصال **WebSocket امن و احراز هویت‌شده** ارائه می‌گردد.
+این سرور چیست؟
+این یک سرور پیام‌رسان بلادرنگ با معماری آفلاین-فرست (Offline-First) است. احراز هویت از طریق REST API و پایگاه داده SQLite (Prisma) انجام می‌شود و تمام جریان چت‌ها در یک بستر امن WebSocket انتقال می‌یابد.
 
-> ⚠️ **نکته‌ی حیاتی — معماری In-Memory:**
-> تمامی پیام‌های چت **فقط و فقط در حافظه RAM سرور** نگهداری می‌شوند. **هیچ‌گونه ذخیره‌سازی پایداری برای پیام‌ها در پایگاه داده وجود ندارد.** در صورت راه‌اندازی مجدد سرور، تمام تاریخچه‌ی چت به صورت دائمی از بین می‌رود. هیچ ویژگی رابط کاربری که نشان دهد پیام‌ها پس از ریستارت سرور باقی می‌مانند را پیاده‌سازی نکنید.
+⚠️ نکته بسیار مهم — معماری:
+سرور در این سیستم فقط به عنوان یک مسیریاب (Router) و صف انتظار (Pending Queue) عمل می‌کند. هیچ تاریخچه‌ای از پیام‌ها روی سرور ذخیره نمی‌شود. وظیفه نگهداری پیام‌ها بر عهده کلاینت (توسط دیتابیس‌های مرورگر مثل Dexie.js / IndexedDB) است. اگر گیرنده آفلاین باشد، سرور پیام را به طور موقت در RAM خود نگه می‌دارد تا کاربر متصل شود.
 
 ### نمای کلی معماری
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                       کلاینت ری‌اکت                              │
+│                       کلاینت ری‌اکت                               │
 │                                                                 │
-│  [REST /api/v1/auth]  ──────────►  ورود / ثبت‌نام / تمدید توکن  │
-│  [WebSocket wss://…]  ◄────────►  تمام پیام‌رسانی آنی           │
+│  [REST /api/v1/auth]  ──────────►  ورود / ثبت‌نام / تمدید توکن      │
+│  [WebSocket wss://…]  ◄────────►  تمام پیام‌رسانی آنی               │
 └─────────────────────────────────────────────────────────────────┘
          │                                      │
          ▼                                      ▼
@@ -915,11 +1068,29 @@ npm install socket.io-client
 یک فایل `.env.local` در ریشه‌ی پروژه‌ی ری‌اکت خود بسازید:
 
 ```env
-# آدرس سرور WebSocket
-VITE_WS_URL=wss://api.yourdomain.com
+NODE_ENV=development
+PORT=
 
-# آدرس پایه REST API (فقط برای اندپوینت‌های احراز هویت)
-VITE_API_URL=https://api.yourdomain.com/api/v1
+# Generate with: openssl rand -hex 64
+JWT_SECRET=your jwt accessToken secret
+JWT_EXPIRES_IN=jwt accessToken expire duration (m)
+
+# Generate with: openssl rand -hex 64
+JWT_REFRESH_SECRET=jwt refreshToken secret
+JWT_REFRESH_EXPIRES_IN=jwt refreshToken expire duration (d)
+
+# Generate with: openssl rand -hex 32
+COOKIE_SECRET=your cookie secret
+
+# Comma-separated, no trailing slash
+ALLOWED_ORIGINS=domains you must allowed to access server
+
+# In-memory store limits
+MSG_STORE_MAX_ROOMS= nuber
+MSG_STORE_MAX_PER_ROOM=number
+MSG_STORE_TTL_MS=number (ms)
+# 1year store pending msg
+MSG_PENDING_TTL_MS=31536000000
 ```
 
 > 📌 **توجه:** برای توسعه‌ی محلی از `ws://` و در تمام محیط‌های پروداکشن، استیجینگ و پیش‌نمایش از `wss://` (WebSocket امن) استفاده کنید. هرگز از یک اتصال رمزنگاری‌نشده `ws://` در برابر سرور پروداکشن استفاده نکنید.
@@ -991,10 +1162,10 @@ export async function login(email: string, password: string) {
 
 سرور JWT را از دو روش می‌پذیرد (به ترتیب اولویت):
 
-| روش | مکانیزم | پیشنهاد برای |
-|---|---|---|
-| **۱. کوکی** (ترجیحی) | کوکی `ws_token` که پس از ورود توسط سرور تنظیم می‌شود | کلاینت‌های مرورگر (خودکار) |
-| **۲. Query Parameter** | `?token=<jwt>` به آخر URL WebSocket اضافه می‌شود | کلاینت‌های native/موبایل |
+| روش                    | مکانیزم                                              | پیشنهاد برای               |
+| ---------------------- | ---------------------------------------------------- | -------------------------- |
+| **۱. کوکی** (ترجیحی)   | کوکی `ws_token` که پس از ورود توسط سرور تنظیم می‌شود | کلاینت‌های مرورگر (خودکار) |
+| **۲. Query Parameter** | `?token=<jwt>` به آخر URL WebSocket اضافه می‌شود     | کلاینت‌های native/موبایل   |
 
 > ⚠️ **نکته امنیتی:** توکن در query string ممکن است در لاگ‌های دسترسی سرور و تاریخچه‌ی مرورگر ظاهر شود. برای توکن‌های کوتاه‌عمر (انقضاء ۱۵ دقیقه‌ای) قابل قبول است، اما مطمئن شوید که طول عمر توکن به حداقل رسیده باشد.
 
@@ -1015,7 +1186,9 @@ export function createAuthenticatedSocket(token: string): WebSocket {
   socket.onclose = (event) => {
     if (event.code === 1006) {
       // کد 1006 = بسته شدن غیرعادی. احتمالاً ناشی از شکست هندشیک (توکن نامعتبر) است.
-      console.error('[WS] اتصال رد شد. توکن ممکن است نامعتبر یا منقضی شده باشد.');
+      console.error(
+        '[WS] اتصال رد شد. توکن ممکن است نامعتبر یا منقضی شده باشد.',
+      );
     }
   };
 
@@ -1027,11 +1200,15 @@ export function createAuthenticatedSocket(token: string): WebSocket {
 
 ## ۳. لیست رویدادها
 
-تمام ارتباطات پس از هندشیک از **رشته‌های JSON سریال‌شده** روی کانال WebSocket استفاده می‌کنند. دو جهت وجود دارد: رویدادهایی که شما **ارسال می‌کنید** (کلاینت → سرور) و رویدادهایی که **گوش می‌دهید** (سرور → کلاینت).
+(Event Catalog)ارتباطات از طریق ارسال و دریافت رشته‌های JSON دارای کلید type انجام می‌شود.
+📤 ارسال از کلاینت به سرور (Emit)
 
-### ۳.۱ — رویدادهای ارسالی (کلاینت → سرور)
-
-همیشه payload خود را با `JSON.stringify()` سریال کنید قبل از اینکه `socket.send()` را صدا بزنید.
+نام رویداد,ساختار داده (Payload),توضیحات
+send_message,"{ to: string, content: string, localId: string }",ارسال پیام. localId یک شناسه یکتا تولید شده در کلاینت برای رهگیری وضعیت پیام است.
+typing_start,{ to: string },اعلام شروع تایپ به مخاطب.
+typing_stop,{ to: string },اعلام توقف تایپ به مخاطب.
+ack_pending,{ ids: string[] },تایید دریافت پیام‌های آفلاین (تا سرور آن‌ها را از RAM پاک کند).
+ping,{ },برای زنده نگه داشتن کانکشن (هر ۲۵ ثانیه ارسال شود).
 
 ---
 
@@ -1039,11 +1216,11 @@ export function createAuthenticatedSocket(token: string): WebSocket {
 
 یک پیام چت جدید به یک اتاق خاص ارسال می‌کند.
 
-| فیلد | نوع | اجباری | توضیح |
-|---|---|---|---|
-| `type` | `string` | ✅ | باید دقیقاً `"send_message"` باشد |
-| `roomId` | `string` | ✅ | شناسه‌ی اتاق مقصد (حروف عددی، حداکثر ۶۴ کاراکتر) |
-| `content` | `string` | ✅ | متن پیام (حداکثر ۲۰۰۰ کاراکتر) |
+| فیلد      | نوع      | اجباری | توضیح                                            |
+| --------- | -------- | ------ | ------------------------------------------------ |
+| `type`    | `string` | ✅     | باید دقیقاً `"send_message"` باشد                |
+| `roomId`  | `string` | ✅     | شناسه‌ی اتاق مقصد (حروف عددی، حداکثر ۶۴ کاراکتر) |
+| `content` | `string` | ✅     | متن پیام (حداکثر ۲۰۰۰ کاراکتر)                   |
 
 ```typescript
 // ارسال: فرستادن یک پیام
@@ -1062,10 +1239,10 @@ socket.send(JSON.stringify(payload));
 
 کلاینت را در یک اتاق مشترک می‌کند و ۵۰ پیام آخر را از تاریخچه‌ی in-memory واکشی می‌کند.
 
-| فیلد | نوع | اجباری | توضیح |
-|---|---|---|---|
-| `type` | `string` | ✅ | باید دقیقاً `"join_room"` باشد |
-| `roomId` | `string` | ✅ | اتاقی که می‌خواهید وارد شوید |
+| فیلد     | نوع      | اجباری | توضیح                          |
+| -------- | -------- | ------ | ------------------------------ |
+| `type`   | `string` | ✅     | باید دقیقاً `"join_room"` باشد |
+| `roomId` | `string` | ✅     | اتاقی که می‌خواهید وارد شوید   |
 
 ```typescript
 // ارسال: ورود به اتاق
@@ -1078,10 +1255,10 @@ socket.send(JSON.stringify({ type: 'join_room', roomId: 'room_general' }));
 
 اشتراک کلاینت را از یک اتاق لغو می‌کند.
 
-| فیلد | نوع | اجباری | توضیح |
-|---|---|---|---|
-| `type` | `string` | ✅ | باید دقیقاً `"leave_room"` باشد |
-| `roomId` | `string` | ✅ | اتاقی که می‌خواهید از آن خارج شوید |
+| فیلد     | نوع      | اجباری | توضیح                              |
+| -------- | -------- | ------ | ---------------------------------- |
+| `type`   | `string` | ✅     | باید دقیقاً `"leave_room"` باشد    |
+| `roomId` | `string` | ✅     | اتاقی که می‌خواهید از آن خارج شوید |
 
 ```typescript
 // ارسال: خروج از اتاق
@@ -1094,10 +1271,10 @@ socket.send(JSON.stringify({ type: 'leave_room', roomId: 'room_general' }));
 
 ۵۰ پیام آخر یک اتاق را از store in-memory درخواست می‌کند.
 
-| فیلد | نوع | اجباری | توضیح |
-|---|---|---|---|
-| `type` | `string` | ✅ | باید دقیقاً `"get_history"` باشد |
-| `roomId` | `string` | ✅ | اتاقی که تاریخچه‌اش را می‌خواهید |
+| فیلد     | نوع      | اجباری | توضیح                            |
+| -------- | -------- | ------ | -------------------------------- |
+| `type`   | `string` | ✅     | باید دقیقاً `"get_history"` باشد |
+| `roomId` | `string` | ✅     | اتاقی که تاریخچه‌اش را می‌خواهید |
 
 ```typescript
 // ارسال: درخواست تاریخچه
@@ -1129,8 +1306,8 @@ interface ChatMessage {
   roomId: string;
   senderId: string;
   senderUsername: string;
-  content: string;       // قبلاً توسط سرور XSS-sanitize شده
-  timestamp: number;     // Unix timestamp به میلی‌ثانیه
+  content: string; // قبلاً توسط سرور XSS-sanitize شده
+  timestamp: number; // Unix timestamp به میلی‌ثانیه
 }
 ```
 
@@ -1183,19 +1360,19 @@ interface RoomLeftEvent {
 
 هنگامی که سرور در پردازش پیام کلاینت با مشکل مواجه می‌شود ارسال می‌گردد.
 
-| کد (`code`) | معنی |
-|---|---|
-| `4001` | خطای اعتبارسنجی (payload ناقص، roomId نامعتبر و غیره) |
-| `4002` | در اتاق نیستید (سعی در ارسال پیام بدون join کردن) |
-| `4003` | محدودیت نرخ فراتر رفته (Rate limit) |
-| `5000` | خطای داخلی سرور |
+| کد (`code`) | معنی                                                  |
+| ----------- | ----------------------------------------------------- |
+| `4001`      | خطای اعتبارسنجی (payload ناقص، roomId نامعتبر و غیره) |
+| `4002`      | در اتاق نیستید (سعی در ارسال پیام بدون join کردن)     |
+| `4003`      | محدودیت نرخ فراتر رفته (Rate limit)                   |
+| `5000`      | خطای داخلی سرور                                       |
 
 ```typescript
 // ساختار payload ورودی
 interface ErrorEvent {
   type: 'error';
   message: string; // توضیح قابل خواندن توسط انسان
-  code: number;    // کد خطای قابل پردازش توسط ماشین
+  code: number; // کد خطای قابل پردازش توسط ماشین
 }
 ```
 
@@ -1203,17 +1380,17 @@ interface ErrorEvent {
 
 ### جدول مرجع کامل رویدادها
 
-| جهت | نوع رویداد | زمان فعال‌سازی | فیلدهای کلیدی Payload |
-|---|---|---|---|
-| ➡️ کلاینت → سرور | `join_room` | ورود به اتاق چت | `roomId` |
-| ➡️ کلاینت → سرور | `leave_room` | خروج از اتاق چت | `roomId` |
-| ➡️ کلاینت → سرور | `send_message` | ارسال پیام چت | `roomId`، `content` |
-| ➡️ کلاینت → سرور | `get_history` | واکشی تاریخچه‌ی اتاق | `roomId` |
-| ⬅️ سرور → کلاینت | `room_joined` | پس از join موفق | `roomId`، `history[]` |
-| ⬅️ سرور → کلاینت | `room_left` | پس از leave موفق | `roomId` |
-| ⬅️ سرور → کلاینت | `new_message` | هنگامی که عضوی پیام ارسال کند | `message` |
-| ⬅️ سرور → کلاینت | `history` | در پاسخ به `get_history` | `roomId`، `messages[]` |
-| ⬅️ سرور → کلاینت | `error` | در صورت هر خطای سرور | `message`، `code` |
+| جهت              | نوع رویداد     | زمان فعال‌سازی                | فیلدهای کلیدی Payload  |
+| ---------------- | -------------- | ----------------------------- | ---------------------- |
+| ➡️ کلاینت → سرور | `join_room`    | ورود به اتاق چت               | `roomId`               |
+| ➡️ کلاینت → سرور | `leave_room`   | خروج از اتاق چت               | `roomId`               |
+| ➡️ کلاینت → سرور | `send_message` | ارسال پیام چت                 | `roomId`، `content`    |
+| ➡️ کلاینت → سرور | `get_history`  | واکشی تاریخچه‌ی اتاق          | `roomId`               |
+| ⬅️ سرور → کلاینت | `room_joined`  | پس از join موفق               | `roomId`، `history[]`  |
+| ⬅️ سرور → کلاینت | `room_left`    | پس از leave موفق              | `roomId`               |
+| ⬅️ سرور → کلاینت | `new_message`  | هنگامی که عضوی پیام ارسال کند | `message`              |
+| ⬅️ سرور → کلاینت | `history`      | در پاسخ به `get_history`      | `roomId`، `messages[]` |
+| ⬅️ سرور → کلاینت | `error`        | در صورت هر خطای سرور          | `message`، `code`      |
 
 ---
 
@@ -1222,6 +1399,18 @@ interface ErrorEvent {
 مثال زیر یک هوک سفارشی `useWebSocket` آماده‌ی پروداکشن و یک کامپوننت همراه `ChatRoom` ارائه می‌دهد. هوک کل چرخه‌ی حیات WebSocket را کپسوله می‌کند: اتصال، احراز هویت، مسیریابی رویداد، اتصال مجدد، و پاکسازی.
 
 ### `useWebSocket.ts` — هوک سفارشی
+
+## ۴. معماری آفلاین-فرست (بسیار مهم)
+
+نحوه مدیریت پیام‌ها در کلاینت (فرانت‌اند):
+
+ارسال: یک localId (UUID) بسازید، پیام را با وضعیت sending در دیتابیس IndexedDB مرورگر ذخیره کنید و رویداد send_message را بفرستید.
+
+تاییدیه: منتظر دریافت رویداد message_sent بمانید. با دریافت آن، پیام را از طریق localId در دیتابیس پیدا کرده و وضعیتش را به sent تغییر دهید.
+
+دریافت: با دریافت رویدادهای new_message یا pending_messages، پیام‌ها را مستقیماً در دیتابیس ذخیره کرده و UI را آپدیت کنید.
+
+تایید (ACK): به محض ذخیره موفق پیام‌های آفلاین، حتماً رویداد ack_pending را به همراه آیدی پیام‌ها (messageIds) به سرور بفرستید تا از حافظه سرور حذف شوند.
 
 ```typescript
 // src/hooks/useWebSocket.ts
@@ -1238,7 +1427,12 @@ export interface ChatMessage {
   timestamp: number;
 }
 
-type ConnectionStatus = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'error';
+type ConnectionStatus =
+  | 'idle'
+  | 'connecting'
+  | 'connected'
+  | 'disconnected'
+  | 'error';
 
 interface WsState {
   messages: ChatMessage[];
@@ -1403,7 +1597,10 @@ export function useWebSocket({
       const isAuthFailure = event.code === 1006 || event.code === 4001;
 
       if (isAuthFailure) {
-        dispatch({ type: 'ERROR', payload: 'احراز هویت ناموفق بود. لطفاً دوباره وارد شوید.' });
+        dispatch({
+          type: 'ERROR',
+          payload: 'احراز هویت ناموفق بود. لطفاً دوباره وارد شوید.',
+        });
         return;
       }
 
@@ -1413,7 +1610,9 @@ export function useWebSocket({
         if (attempts < maxReconnectAttempts) {
           // Exponential backoff: ۲ثانیه، ۴ثانیه، ۸ثانیه، ...
           const delay = reconnectDelay * Math.pow(2, attempts);
-          console.warn(`[WS] قطع اتصال. اتصال مجدد در ${delay}ms... (تلاش ${attempts + 1})`);
+          console.warn(
+            `[WS] قطع اتصال. اتصال مجدد در ${delay}ms... (تلاش ${attempts + 1})`,
+          );
           reconnectAttemptsRef.current += 1;
           reconnectTimerRef.current = setTimeout(connect, delay);
         } else {
@@ -1484,8 +1683,8 @@ import React, { useState, useRef, useEffect, FormEvent } from 'react';
 import { useWebSocket, ChatMessage } from '../hooks/useWebSocket';
 
 interface ChatRoomProps {
-  token: string;       // توکن JWT از state/context احراز هویت شما
-  roomId: string;      // اتاقی که باید به آن وصل شوید
+  token: string; // توکن JWT از state/context احراز هویت شما
+  roomId: string; // اتاقی که باید به آن وصل شوید
   currentUserId: string; // شناسه‌ی کاربر فعلی (برای تمایز پیام‌های ارسالی از دریافتی)
 }
 
@@ -1521,17 +1720,51 @@ export function ChatRoom({ token, roomId, currentUserId }: ChatRoomProps) {
   const { label, color } = statusConfig[status];
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', direction: 'rtl' }}>
-
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        height: '100%',
+        direction: 'rtl',
+      }}
+    >
       {/* هدر */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 16px', borderBottom: '1px solid #e5e7eb' }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 8,
+          padding: '12px 16px',
+          borderBottom: '1px solid #e5e7eb',
+        }}
+      >
         <h2 style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>#{roomId}</h2>
-        <span style={{ marginRight: 'auto', fontSize: 12, color, display: 'flex', alignItems: 'center', gap: 4 }}>
-          <span style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: color, display: 'inline-block' }} />
+        <span
+          style={{
+            marginRight: 'auto',
+            fontSize: 12,
+            color,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 4,
+          }}
+        >
+          <span
+            style={{
+              width: 8,
+              height: 8,
+              borderRadius: '50%',
+              backgroundColor: color,
+              display: 'inline-block',
+            }}
+          />
           {label}
         </span>
         {(status === 'disconnected' || status === 'error') && (
-          <button onClick={reconnect} style={{ fontSize: 12, padding: '4px 8px', cursor: 'pointer' }}>
+          <button
+            onClick={reconnect}
+            style={{ fontSize: 12, padding: '4px 8px', cursor: 'pointer' }}
+          >
             اتصال مجدد
           </button>
         )}
@@ -1539,25 +1772,58 @@ export function ChatRoom({ token, roomId, currentUserId }: ChatRoomProps) {
 
       {/* بنر خطا */}
       {error && (
-        <div style={{ background: '#fef2f2', color: '#b91c1c', padding: '8px 16px', fontSize: 13 }}>
+        <div
+          style={{
+            background: '#fef2f2',
+            color: '#b91c1c',
+            padding: '8px 16px',
+            fontSize: 13,
+          }}
+        >
           ⚠️ {error}
         </div>
       )}
 
       {/* پیام‌ها */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div
+        style={{
+          flex: 1,
+          overflowY: 'auto',
+          padding: 16,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 12,
+        }}
+      >
         {status === 'connecting' && (
-          <p style={{ color: '#9ca3af', textAlign: 'center', marginTop: 32 }}>در حال اتصال به اتاق…</p>
+          <p style={{ color: '#9ca3af', textAlign: 'center', marginTop: 32 }}>
+            در حال اتصال به اتاق…
+          </p>
         )}
         {messages.length === 0 && status === 'connected' && (
-          <p style={{ color: '#9ca3af', textAlign: 'center', marginTop: 32 }}>هنوز پیامی وجود ندارد. اولین نفر باشید!</p>
+          <p style={{ color: '#9ca3af', textAlign: 'center', marginTop: 32 }}>
+            هنوز پیامی وجود ندارد. اولین نفر باشید!
+          </p>
         )}
         {messages.map((msg: ChatMessage) => {
           const isOwn = msg.senderId === currentUserId;
           return (
-            <div key={msg.id} style={{ alignSelf: isOwn ? 'flex-start' : 'flex-end', maxWidth: '70%' }}>
+            <div
+              key={msg.id}
+              style={{
+                alignSelf: isOwn ? 'flex-start' : 'flex-end',
+                maxWidth: '70%',
+              }}
+            >
               {!isOwn && (
-                <p style={{ margin: '0 4px 2px', fontSize: 11, color: '#6b7280', fontWeight: 600 }}>
+                <p
+                  style={{
+                    margin: '0 4px 2px',
+                    fontSize: 11,
+                    color: '#6b7280',
+                    fontWeight: 600,
+                  }}
+                >
                   {msg.senderUsername}
                 </p>
               )}
@@ -1565,7 +1831,9 @@ export function ChatRoom({ token, roomId, currentUserId }: ChatRoomProps) {
                 style={{
                   background: isOwn ? '#3b82f6' : '#f3f4f6',
                   color: isOwn ? '#fff' : '#111827',
-                  borderRadius: isOwn ? '16px 16px 16px 4px' : '16px 16px 4px 16px',
+                  borderRadius: isOwn
+                    ? '16px 16px 16px 4px'
+                    : '16px 16px 4px 16px',
                   padding: '10px 14px',
                   fontSize: 14,
                   lineHeight: 1.7,
@@ -1575,8 +1843,18 @@ export function ChatRoom({ token, roomId, currentUserId }: ChatRoomProps) {
               >
                 {msg.content}
               </div>
-              <p style={{ margin: '2px 4px 0', fontSize: 10, color: '#9ca3af', textAlign: isOwn ? 'left' : 'right' }}>
-                {new Date(msg.timestamp).toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' })}
+              <p
+                style={{
+                  margin: '2px 4px 0',
+                  fontSize: 10,
+                  color: '#9ca3af',
+                  textAlign: isOwn ? 'left' : 'right',
+                }}
+              >
+                {new Date(msg.timestamp).toLocaleTimeString('fa-IR', {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                })}
               </p>
             </div>
           );
@@ -1585,7 +1863,15 @@ export function ChatRoom({ token, roomId, currentUserId }: ChatRoomProps) {
       </div>
 
       {/* ورودی */}
-      <form onSubmit={handleSubmit} style={{ display: 'flex', gap: 8, padding: 16, borderTop: '1px solid #e5e7eb' }}>
+      <form
+        onSubmit={handleSubmit}
+        style={{
+          display: 'flex',
+          gap: 8,
+          padding: 16,
+          borderTop: '1px solid #e5e7eb',
+        }}
+      >
         <button
           type="submit"
           disabled={!inputValue.trim() || status !== 'connected'}
@@ -1606,7 +1892,11 @@ export function ChatRoom({ token, roomId, currentUserId }: ChatRoomProps) {
           type="text"
           value={inputValue}
           onChange={(e) => setInputValue(e.target.value)}
-          placeholder={status === 'connected' ? 'پیام خود را بنویسید…' : 'اتصال برقرار نیست'}
+          placeholder={
+            status === 'connected'
+              ? 'پیام خود را بنویسید…'
+              : 'اتصال برقرار نیست'
+          }
           disabled={status !== 'connected'}
           maxLength={2000}
           style={{
@@ -1641,8 +1931,24 @@ const currentUserId = '6579c6f0a3e4d12b8c9f1234';
 
 function App() {
   return (
-    <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-      <div style={{ width: '100%', maxWidth: 720, height: '80vh', border: '1px solid #e5e7eb', borderRadius: 16, overflow: 'hidden' }}>
+    <div
+      style={{
+        height: '100vh',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+      }}
+    >
+      <div
+        style={{
+          width: '100%',
+          maxWidth: 720,
+          height: '80vh',
+          border: '1px solid #e5e7eb',
+          borderRadius: 16,
+          overflow: 'hidden',
+        }}
+      >
         <ChatRoom
           token={token}
           roomId="room_general"
@@ -1676,4 +1982,4 @@ export default App;
 
 ---
 
-*این مستند توسط تیم مهندسی بک‌اند تهیه شده است. برای سؤالات بیشتر با تیم مربوطه تماس بگیرید.*
+_این مستند توسط تیم مهندسی بک‌اند تهیه شده است. برای سؤالات بیشتر با تیم مربوطه تماس بگیرید._

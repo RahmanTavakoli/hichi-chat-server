@@ -35,7 +35,7 @@ function toWire(stored: StoredMessage, toUsername: string, localId?: string): Wi
 
 /** Safe send — never throws, logs if socket is not ready */
 function safeSend(ws: AuthenticatedWebSocket, payload: unknown): void {
-  if (ws.readyState === 1 /* WebSocket.OPEN */) {
+  if (ws.readyState === 1) {
     ws.send(JSON.stringify(payload));
   } else {
     wsLogger.warn('safeSend skipped — socket not open', {
@@ -78,28 +78,24 @@ export function deliverPendingMessages(ws: AuthenticatedWebSocket): void {
   const pending = messageStore.pending.flush(ws.username);
   if (pending.length === 0) return;
 
-  wsLogger.info('Delivering pending messages', {
-    username: ws.username,
-    count: pending.length,
-  });
+  wsLogger.info('Delivering pending messages', { username: ws.username, count: pending.length });
 
-  // Convert stored pending messages to wire format
   const wireMessages: WireMessage[] = pending.map((m) => toWire(m, ws.username, undefined));
 
   safeSend(ws, {
     type: 'pending_messages',
     messages: wireMessages,
-    messageIds: pending.map((m) => m.id), // IDs for ACK
+    messageIds: pending.map((m) => m.id),
   });
 
-  // Track flushed messages on the ws object so we can requeue if socket drops
-  // before ACK arrives (attach to ws object to avoid closure leaks)
   (ws as AuthenticatedWebSocket & { _pendingFlushed?: typeof pending })._pendingFlushed = pending;
 }
 
 // ─── Schema extension — add messages_ack ──────────────────────────────────────
 // Note: messages_ack is not in the Zod schema so we handle it as a raw check
 // here to avoid modifying the Zod discriminated union for a simple ACK.
+
+// ─── Raw frame guards (bypass Zod for simple ACK-style frames) ────────────────
 
 interface MessagesAckFrame {
   type: 'messages_ack';
@@ -116,21 +112,89 @@ function isMessagesAck(raw: unknown): raw is MessagesAckFrame {
   );
 }
 
+// mark_read: sent by RECIPIENT when they open a chat and see messages
+// Server relays it to the original SENDER as `messages_read`
+interface MarkReadFrame {
+  type: 'mark_read';
+  chatId: string; // "dm:alice:bob"
+  messageIds: string[]; // server-assigned UUIDs of messages now seen
+}
+function isMarkRead(raw: unknown): raw is MarkReadFrame {
+  if (typeof raw !== 'object' || raw === null) return false;
+  const r = raw as Record<string, unknown>;
+  return (
+    r['type'] === 'mark_read' &&
+    typeof r['chatId'] === 'string' &&
+    Array.isArray(r['messageIds']) &&
+    (r['messageIds'] as unknown[]).every((id) => typeof id === 'string')
+  );
+}
+
+// ─── Main Dispatcher ──────────────────────────────────────────────────────────
+
 // ─── Main Dispatcher ──────────────────────────────────────────────────────────
 
 export function handleWsEvent(ws: AuthenticatedWebSocket, raw: unknown): void {
-  // ── messages_ack (not in main schema — handle first) ─────────────────────
+  // ── Offline delivery ACK ──────────────────────────────────────────────────
   if (isMessagesAck(raw)) {
-    const { messageIds } = raw;
-    messageStore.pending.clear(ws.username, messageIds);
-
-    // Clear the tracked flushed buffer — delivery confirmed
+    messageStore.pending.clear(ws.username, raw.messageIds);
     delete (ws as AuthenticatedWebSocket & { _pendingFlushed?: unknown })._pendingFlushed;
-
     wsLogger.info('Pending messages acknowledged', {
       username: ws.username,
+      count: raw.messageIds.length,
+    });
+    return;
+  }
+
+  // ── Read receipt (recipient → server → sender) ────────────────────────────
+  //
+  // When Bob opens a chat with Alice:
+  //   Bob's client  → { type: 'mark_read', chatId: 'dm:alice:bob', messageIds: [...] }
+  //   Server        → looks up Alice in userRegistry
+  //   Alice online  → { type: 'messages_read', chatId, messageIds, by: 'bob' }
+  //   Alice's UI    → upgrades those messages: 'sent'/'delivered' → 'read' (✓✓ blue)
+  //
+  if (isMarkRead(raw)) {
+    const { chatId, messageIds } = raw;
+    const readerUsername = ws.username;
+
+    if (messageIds.length === 0) return;
+
+    wsLogger.info('mark_read received', {
+      from: readerUsername,
+      chatId,
       count: messageIds.length,
     });
+
+    // Parse sender username from chatId: "dm:alice:bob" → whichever is not the reader
+    const chatParts = chatId.replace(/^dm:/, '').split(':');
+    const senderUsername = chatParts.find((p) => p.toLowerCase() !== readerUsername.toLowerCase());
+
+    if (!senderUsername) {
+      wsLogger.warn('mark_read: cannot parse sender from chatId', {
+        chatId,
+        reader: readerUsername,
+      });
+      return;
+    }
+
+    const senderWs = userRegistry.get(senderUsername.toLowerCase());
+    if (senderWs && senderWs.readyState === 1) {
+      safeSend(senderWs, {
+        type: 'messages_read',
+        chatId,
+        messageIds,
+        by: readerUsername,
+      });
+      wsLogger.info('Read receipt forwarded to sender', {
+        sender: senderUsername,
+        reader: readerUsername,
+        count: messageIds.length,
+      });
+    } else {
+      // Sender offline — read receipt is best-effort (informational only)
+      wsLogger.debug('Read receipt dropped — sender offline', { sender: senderUsername });
+    }
     return;
   }
 
@@ -204,6 +268,27 @@ export function handleWsEvent(ws: AuthenticatedWebSocket, raw: unknown): void {
       const recipientWs = userRegistry.get(msg.to.toLowerCase());
       if (recipientWs) safeSend(recipientWs, { type: 'typing_stop', from: ws.username });
       wsLogger.debug('Typing stop', { from: ws.username, to: msg.to });
+      break;
+    }
+
+    // ── mark_read ─────────────────────────────────────────────────────────────
+    case 'mark_read': {
+      wsLogger.info(
+        `[MARK_READ] User '${ws.username}' read ${msg.messageIds.length} messages from '${msg.to}'`,
+      );
+
+      const senderWs = userRegistry.get(msg.to.toLowerCase());
+      if (senderWs) {
+        safeSend(senderWs, {
+          type: 'messages_read',
+          chatId: dmRoomKey(ws.username, msg.to),
+          messageIds: msg.messageIds,
+        });
+        wsLogger.info(`[MARK_READ] 🚀 Forwarded read receipt (blue ticks) to '${msg.to}'`);
+      } else {
+        // نکته: اگر فرستنده آفلاین باشد، در حال حاضر تیک آبی موقتاً گم می‌شود
+        wsLogger.warn(`[MARK_READ] ⚠️ Cannot forward receipt, sender '${msg.to}' is offline.`);
+      }
       break;
     }
 
